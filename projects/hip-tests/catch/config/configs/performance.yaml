@@ -275,5 +275,6 @@ performance:
   Performance_hipPerfHostNumaAlloc_test_preferred_host_numa_node_on_each_GPU: *level_stress
   Performance_Graph_CollapseCorrectness: *level_stress
   Performance_Graph_DisabledBoundarySynchronization: *level_stress
+  Performance_Graph_CollapsedIndependentCompletion: *level_stress
   Performance_hipPerfSharedQueueAnyOrderOverlap: *level_stress
   Performance_hipPerfSharedQueueAnyOrderOverlap_EventDependency: *level_stress
