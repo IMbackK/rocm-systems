@@ -246,3 +246,9 @@ EXPORTS
   hsa_amd_vmem_get_vmem_info
   hsa_amd_signal_batch_create
   hsa_amd_signal_batch_destroy
+  hsa_ven_amd_graph_get_capabilities
+  hsa_ven_amd_graph_command_list_create
+  hsa_ven_amd_graph_command_list_destroy
+  hsa_ven_amd_graph_command_list_get_info
+  hsa_ven_amd_graph_command_list_materialize_packet
+  hsa_ven_amd_graph_command_list_materialize_packet_for_queue

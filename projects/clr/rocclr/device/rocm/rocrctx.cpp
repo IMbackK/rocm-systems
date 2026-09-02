@@ -103,6 +103,12 @@ bool Hsa::LoadLib() {
   // loaded ROCr can lack them: a linked build requires them, as it does hsa_amd_queue_create.
   GET_ROCR_OPTIONAL_SYMBOL(hsa_amd_signal_batch_create)
   GET_ROCR_OPTIONAL_SYMBOL(hsa_amd_signal_batch_destroy)
+  GET_ROCR_OPTIONAL_SYMBOL(hsa_ven_amd_graph_get_capabilities)
+  GET_ROCR_OPTIONAL_SYMBOL(hsa_ven_amd_graph_command_list_create)
+  GET_ROCR_OPTIONAL_SYMBOL(hsa_ven_amd_graph_command_list_destroy)
+  GET_ROCR_OPTIONAL_SYMBOL(hsa_ven_amd_graph_command_list_get_info)
+  GET_ROCR_OPTIONAL_SYMBOL(hsa_ven_amd_graph_command_list_materialize_packet)
+  GET_ROCR_OPTIONAL_SYMBOL(hsa_ven_amd_graph_command_list_materialize_packet_for_queue)
   GET_ROCR_SYMBOL(hsa_amd_memory_async_copy_rect)
   GET_ROCR_SYMBOL(hsa_amd_memory_lock_to_pool)
   GET_ROCR_SYMBOL(hsa_amd_signal_value_pointer)
