@@ -1,6 +1,6 @@
 .. meta::
    :description: Design and qualification plan for retained PM4 graph command lists
-   :keywords: ROCR, HIP graphs, PM4, AQL, GFX11, GFX12
+   :keywords: ROCR, HIP graphs, PM4, AQL, GFX9, GFX11, GFX12
 
 .. _retained-pm4-command-lists:
 
@@ -23,7 +23,7 @@ lifetime and submits the resulting vendor packet through its existing stream
 queue so queue tracking, stream ordering, profiling, and completion remain
 consistent with ordinary graph replay.
 
-All declared GFX11 and GFX12 targets have compile-time encoders. Hardware that
+All declared GFX9, GFX11 and GFX12 targets have compile-time encoders. Hardware that
 has not completed qualification additionally requires
 ``DEBUG_HIP_GRAPH_PM4_UNQUALIFIED=1``. This second gate is for bring-up only and
 does not add the ASIC to the default qualification allowlist.
@@ -181,6 +181,21 @@ resource-aware policy may use a narrower VMEM-only boundary only when verified
 kernel metadata proves the consumer's cache class. Unknown metadata always
 uses the fail-closed scalar/vector boundary.
 
+GFX9 has no GCR_CNTL field: its ACQUIRE_MEM selects actions through
+CP_COHER_CNTL and its CP_COHER_SIZE_HI is 24 bits wide. The accepted GFX9
+boundary keeps the same shape:
+
+1. ``CS_PARTIAL_FLUSH`` / compute-idle;
+2. ``ACQUIRE_MEM`` with ``SH_ICACHE|SH_KCACHE|TC|TCL1|TC_WB``;
+3. the consumer dispatch.
+
+The narrowed VMEM-only variant drops the two shader-cache actions and keeps
+``TC|TCL1|TC_WB``. GFX9 lists must never carry the GFX11 GCR words, and the
+RSRC3 write is omitted rather than written as zero, because window offset
+``0x228`` is ``COMPUTE_STATIC_THREAD_MGMT_SE7`` on GFX9 and would mask shader
+engines. Wave32 mode does not exist on GFX9, so a kernel declaring it falls
+back instead of being dispatched as wave64.
+
 Target ROCR abstraction
 -----------------------
 
@@ -266,6 +281,10 @@ The source tree currently declares these concrete targets:
      - Targets
      - Encoder
      - Initial runtime state
+   * - GFX9 Vega/CDNA
+     - ``gfx900``, ``gfx902``, ``gfx904``, ``gfx906``, ``gfx908``, ``gfx90a``
+     - GFX9 register map, CP_COHER_CNTL acquire, no wave32
+     - Encoder implemented; qualification gates below still outstanding
    * - GFX11 RDNA3
      - ``gfx1100``, ``gfx1101``, ``gfx1102``, ``gfx1103``
      - Legacy GFX10/GFX11 register map

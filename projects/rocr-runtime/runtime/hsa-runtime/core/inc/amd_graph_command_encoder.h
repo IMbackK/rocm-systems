@@ -37,6 +37,227 @@ inline GraphCommandCapability GetGraphCommandCapability(uint32_t major, uint32_t
   return {HSA_VEN_AMD_GRAPH_ENCODER_NONE, false, false};
 }
 
+struct Gfx9KernelImage {
+  uint64_t code_entry;
+  uint32_t compute_pgm_rsrc1;
+  uint32_t compute_pgm_rsrc2;
+  uint16_t kernel_code_properties;
+  uint16_t kernarg_preload_length;
+};
+
+/*
+ * GFX9 (Vega, Arcturus, Aldebaran) encoder.
+ *
+ * SET_SH_REG offsets are relative to PACKET3_SET_SH_REG_START (0x2c00) and
+ * gc_9_0 maps its compute block at MMIO 0x2000 + 0xe00, so every register this
+ * encoder touches carries the same window offset as gc_10_1/gc_11_0.  The
+ * packet set is what differs, and none of the GFX11 words may be replayed
+ * here:
+ *
+ *   - COMPUTE_PGM_RSRC3 does not exist.  Window offset 0x228 is
+ *     COMPUTE_STATIC_THREAD_MGMT_SE7 on GFX9, so writing the GFX11 RSRC3 slot
+ *     would mask shader engines.  Wave32 mode is absent as well; a kernel
+ *     declaring it is rejected rather than silently run as wave64.
+ *   - ACQUIRE_MEM carries no GCR_CNTL.  Coherency actions live in the
+ *     CP_COHER_CNTL bits and CP_COHER_SIZE_HI is 24 bits wide, matching
+ *     gfx_v9_0_emit_mem_sync().
+ *   - COMPUTE_DISPATCH_INITIATOR has no CS_W32_EN.  A plain compute dispatch is
+ *     COMPUTE_SHADER_EN plus FORCE_START_AT_000 so COMPUTE_START_* left behind
+ *     by another resident cannot shrink the grid.
+ */
+class Gfx9CommandEncoder {
+ public:
+  Gfx9CommandEncoder() { AcquireSystem(); }
+
+  bool Append(const hsa_kernel_dispatch_packet_t& packet, const Gfx9KernelImage& image,
+              uint32_t kernel_flags, hsa_ven_amd_graph_dependency_t dependency) {
+    if ((kernel_flags & HSA_VEN_AMD_GRAPH_KERNEL_DYNAMIC_CALLSTACK) != 0 ||
+        (image.kernel_code_properties & ~kSupportedKernelProperties) != 0 ||
+        (packet.private_segment_size != 0 &&
+         (image.kernel_code_properties & kEnableSgprPrivateSegmentBuffer) != 0) ||
+        image.kernarg_preload_length != 0 || image.code_entry == 0 ||
+        (image.code_entry & 0xff) != 0) {
+      return false;
+    }
+    if (packet.workgroup_size_x == 0 || packet.workgroup_size_y == 0 ||
+        packet.workgroup_size_z == 0 ||
+        packet.grid_size_x % packet.workgroup_size_x != 0 ||
+        packet.grid_size_y % packet.workgroup_size_y != 0 ||
+        packet.grid_size_z % packet.workgroup_size_z != 0) {
+      return false;
+    }
+
+    const uint32_t lds_blocks = packet.group_segment_size / kLdsGranule +
+                                (packet.group_segment_size % kLdsGranule != 0);
+    if (lds_blocks > (kLdsSizeMask >> kLdsSizeShift)) {
+      return false;
+    }
+    const uint32_t rsrc2 =
+        (image.compute_pgm_rsrc2 & ~kLdsSizeMask) | (lds_blocks << kLdsSizeShift);
+
+    if (dispatch_count_ != 0) {
+      if (dependency == HSA_VEN_AMD_GRAPH_DEPENDENCY_SAME_AGENT_RMW) {
+        DependencyRmwSameAgent();
+      } else if (dependency == HSA_VEN_AMD_GRAPH_DEPENDENCY_VMEM_ONLY &&
+                 (kernel_flags & HSA_VEN_AMD_GRAPH_KERNEL_VERIFIED_VMEM_ONLY) != 0) {
+        DependencyRmwVmem();
+      } else {
+        return false;
+      }
+    }
+
+    const uint32_t pgm[] = {
+        static_cast<uint32_t>(image.code_entry >> 8),
+        static_cast<uint32_t>(image.code_entry >> 40),
+    };
+    SetShRegs(kComputePgmLo, pgm, 2);
+    const uint32_t rsrc[] = {image.compute_pgm_rsrc1, rsrc2};
+    SetShRegs(kComputePgmRsrc1, rsrc, 2);
+    const uint32_t zero = 0;
+    const size_t tmpring_words_before = words_.size();
+    SetShRegs(kComputeTmpRingSize, &zero, 1);
+    if (tmpring_patch_dword_ == kNoPatchDword && words_.size() != tmpring_words_before) {
+      tmpring_patch_dword_ = words_.size() - 1;
+    }
+    const uint32_t workgroup[] = {packet.workgroup_size_x, packet.workgroup_size_y,
+                                  packet.workgroup_size_z};
+    SetShRegs(kComputeNumThreadX, workgroup, 3);
+    SetShRegs(kComputeResourceLimits, &zero, 1);
+
+    uint32_t user_sgprs[6] = {};
+    size_t user_sgpr_count = 0;
+    if ((image.kernel_code_properties & kEnableSgprPrivateSegmentBuffer) != 0) {
+      user_sgpr_count += 4;
+    }
+    if ((image.kernel_code_properties & kEnableSgprKernargSegmentPtr) != 0) {
+      if (packet.kernarg_address == nullptr) {
+        return false;
+      }
+      const uint64_t kernarg = reinterpret_cast<uint64_t>(packet.kernarg_address);
+      user_sgprs[user_sgpr_count++] = static_cast<uint32_t>(kernarg);
+      user_sgprs[user_sgpr_count++] = static_cast<uint32_t>(kernarg >> 32);
+    }
+    if (user_sgpr_count != 0) {
+      SetShRegs(kComputeUserData0, user_sgprs, user_sgpr_count);
+    }
+
+    const uint32_t workgroups[] = {
+        packet.grid_size_x / packet.workgroup_size_x,
+        packet.grid_size_y / packet.workgroup_size_y,
+        packet.grid_size_z / packet.workgroup_size_z,
+    };
+    words_.push_back(Packet3(kPacket3DispatchDirect, 4, true));
+    words_.insert(words_.end(), workgroups, workgroups + 3);
+    words_.push_back(kDispatchInitiator);
+    ++dispatch_count_;
+    return true;
+  }
+
+  void Finish() { WaitComputeIdle(); }
+  const std::vector<uint32_t>& words() const { return words_; }
+  size_t dispatch_count() const { return dispatch_count_; }
+  size_t tmpring_patch_dword() const { return tmpring_patch_dword_; }
+
+ private:
+  static constexpr uint32_t kPacket3SetShReg = 0x76;
+  static constexpr uint32_t kPacket3DispatchDirect = 0x15;
+  static constexpr uint32_t kPacket3EventWrite = 0x46;
+  static constexpr uint32_t kPacket3AcquireMem = 0x58;
+  static constexpr uint32_t kComputeNumThreadX = 0x207;
+  static constexpr uint32_t kComputePgmLo = 0x20c;
+  static constexpr uint32_t kComputePgmRsrc1 = 0x212;
+  static constexpr uint32_t kComputeResourceLimits = 0x215;
+  static constexpr uint32_t kComputeTmpRingSize = 0x218;
+  static constexpr uint32_t kComputeUserData0 = 0x240;
+  static constexpr uint32_t kLdsSizeMask = 0x00ff8000;
+  static constexpr uint32_t kLdsSizeShift = 15;
+  static constexpr uint32_t kLdsGranule = 512;
+  static constexpr uint16_t kEnableSgprPrivateSegmentBuffer = 1 << 0;
+  static constexpr uint16_t kEnableSgprKernargSegmentPtr = 1 << 3;
+  // Wavefront-size-32 (bit 10) is deliberately unsupported: GFX9 has no
+  // CS_W32_EN, so a wave32 kernel must fail closed instead of running wide.
+  static constexpr uint16_t kSupportedKernelProperties =
+      kEnableSgprPrivateSegmentBuffer | kEnableSgprKernargSegmentPtr;
+  static constexpr uint32_t kDispatchInitiator = (1u << 0) | (1u << 2);
+  // CP_COHER_CNTL: SH_ICACHE | SH_KCACHE | TC | TCL1 | TC_WB.
+  static constexpr uint32_t kCoherCntlFull =
+      (1u << 29) | (1u << 27) | (1u << 23) | (1u << 22) | (1u << 18);
+  // Narrowed boundary for a verified VMEM-only consumer: the same L2/L1
+  // actions without the scalar constant cache invalidation.
+  static constexpr uint32_t kCoherCntlVmem = (1u << 23) | (1u << 22) | (1u << 18);
+  static constexpr uint32_t kCoherSizeHi = 0x00ffffff;
+  static constexpr uint32_t kCoherPollInterval = 10;
+  // EVENT_TYPE CS_PARTIAL_FLUSH with EVENT_INDEX compute.
+  static constexpr uint32_t kEventCsPartialFlush = (7u << 0) | (4u << 8);
+
+  static uint32_t Packet3(uint32_t opcode, uint32_t body_dwords, bool compute) {
+    return (3u << 30) | ((body_dwords - 1) << 16) | (opcode << 8) |
+           (compute ? 1u << 1 : 0);
+  }
+
+  void AcquireSystem() { EmitAcquire(kCoherCntlFull); }
+
+  void WaitComputeIdle() {
+    words_.push_back(Packet3(kPacket3EventWrite, 1, false));
+    words_.push_back(kEventCsPartialFlush);
+  }
+
+  void DependencyRmwSameAgent() {
+    WaitComputeIdle();
+    EmitAcquire(kCoherCntlFull);
+  }
+
+  void DependencyRmwVmem() {
+    WaitComputeIdle();
+    EmitAcquire(kCoherCntlVmem);
+  }
+
+  void EmitAcquire(uint32_t coher_cntl) {
+    words_.insert(words_.end(), {
+        Packet3(kPacket3AcquireMem, 6, false), coher_cntl, UINT32_MAX, kCoherSizeHi, 0,
+        0, kCoherPollInterval,
+    });
+  }
+
+  void SetShRegs(uint32_t first, const uint32_t* values, size_t count) {
+    size_t i = 0;
+    while (i < count) {
+      while (i < count) {
+        const uint32_t reg = first + static_cast<uint32_t>(i);
+        const auto it = register_state_.find(reg);
+        if (it == register_state_.end() || it->second != values[i]) {
+          break;
+        }
+        ++i;
+      }
+      if (i == count) {
+        break;
+      }
+      const size_t run_start = i;
+      while (i < count) {
+        const uint32_t reg = first + static_cast<uint32_t>(i);
+        const auto it = register_state_.find(reg);
+        if (it != register_state_.end() && it->second == values[i]) {
+          break;
+        }
+        register_state_[reg] = values[i];
+        ++i;
+      }
+      const size_t run_count = i - run_start;
+      words_.push_back(Packet3(kPacket3SetShReg,
+                               1 + static_cast<uint32_t>(run_count), true));
+      words_.push_back(first + static_cast<uint32_t>(run_start));
+      words_.insert(words_.end(), values + run_start, values + run_start + run_count);
+    }
+  }
+
+  std::vector<uint32_t> words_;
+  std::map<uint32_t, uint32_t> register_state_;
+  size_t dispatch_count_ = 0;
+  static constexpr size_t kNoPatchDword = static_cast<size_t>(-1);
+  size_t tmpring_patch_dword_ = kNoPatchDword;
+};
+
 struct Gfx11KernelImage {
   uint64_t code_entry;
   uint32_t compute_pgm_rsrc1;

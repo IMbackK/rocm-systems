@@ -45,6 +45,14 @@ constexpr uint16_t kPm4IndirectBufferFormat = 1;
 constexpr uint32_t kPacket3IndirectBuffer = 0x3f;
 constexpr uint32_t kIbValid = 1u << 23;
 constexpr uint32_t kIbTemporalLu = 3u << 28;
+// GFX9 has no TEMPORAL_LU field; bits 29:28 of the INDIRECT_BUFFER size dword
+// are the CP_COHER cache policy, where 1 selects streaming fetch (soc15d.h).
+constexpr uint32_t kIbCachePolicyStream = 1u << 28;
+
+inline uint32_t IbFetchHint(hsa_ven_amd_graph_encoder_family_t family) {
+  return family == HSA_VEN_AMD_GRAPH_ENCODER_GFX9 ? kIbCachePolicyStream
+                                                  : kIbTemporalLu;
+}
 
 class CommandList {
  public:
@@ -243,6 +251,22 @@ bool LoadGfx11KernelImage(const hsa_kernel_dispatch_packet_t& packet,
   return true;
 }
 
+bool LoadGfx9KernelImage(const hsa_kernel_dispatch_packet_t& packet,
+                         Gfx9KernelImage* image) {
+  Gfx11KernelImage legacy{};
+  if (image == nullptr || !LoadGfx11KernelImage(packet, &legacy)) {
+    return false;
+  }
+  *image = {
+      legacy.code_entry,
+      legacy.compute_pgm_rsrc1,
+      legacy.compute_pgm_rsrc2,
+      legacy.kernel_code_properties,
+      legacy.kernarg_preload_length,
+  };
+  return true;
+}
+
 bool LoadGfx12KernelImage(const hsa_kernel_dispatch_packet_t& packet,
                           Gfx12KernelImage* image) {
   Gfx11KernelImage legacy{};
@@ -330,6 +354,38 @@ hsa_status_t Create(hsa_agent_t hsa_agent,
   uint32_t private_wave64 = 0;
   constexpr uint16_t kEnableWavefrontSize32 = 1u << 10;
   if (capabilities.encoder_family == HSA_VEN_AMD_GRAPH_ENCODER_GFX9) {
+    Gfx9CommandEncoder builder;
+    for (size_t i = 0; i < desc->packet_count; ++i) {
+      const auto& packet = desc->packets[i];
+      if (!validate_packet(packet)) {
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+      }
+      const auto dependency = i == 0 ? HSA_VEN_AMD_GRAPH_DEPENDENCY_SAME_AGENT_RMW
+                                     : desc->dependencies[i - 1];
+      Gfx9KernelImage image{};
+      if (!LoadGfx9KernelImage(packet, &image)) {
+        if (DiagnosticsEnabled()) {
+          std::fprintf(stderr,
+                       "[ROCR graph PM4] reject packet=%zu family=%u kernel=0x%016llx "
+                       "reason=loader-descriptor\n",
+                       i, static_cast<unsigned>(capabilities.encoder_family),
+                       static_cast<unsigned long long>(packet.kernel_object));
+        }
+        return HSA_STATUS_ERROR_INVALID_CODE_OBJECT;
+      }
+      if (!builder.Append(packet, image, desc->kernel_flags[i], dependency)) {
+        PrintEncoderRejection(i, capabilities.encoder_family, packet, image,
+                              desc->kernel_flags[i], dependency);
+        return HSA_STATUS_ERROR_INVALID_CODE_OBJECT;
+      }
+      // Append() rejects the wave32 property, so every retained private segment
+      // is a wave64 one; COMPUTE_TMPRING_SIZE has a single wave size on GFX9.
+      private_wave64 = std::max(private_wave64, packet.private_segment_size);
+    }
+    builder.Finish();
+    words = builder.words();
+    dispatch_count = static_cast<uint32_t>(builder.dispatch_count());
+    tmpring_patch_dword = builder.tmpring_patch_dword();
   } else if (capabilities.encoder_family == HSA_VEN_AMD_GRAPH_ENCODER_GFX11) {
     Gfx11CommandEncoder builder;
     for (size_t i = 0; i < desc->packet_count; ++i) {
@@ -531,7 +587,8 @@ hsa_status_t Materialize(hsa_ven_amd_graph_command_list_t handle, hsa_queue_t* q
       (3u << 30) | (2u << 16) | (kPacket3IndirectBuffer << 8);
   packet.indirect_buffer[1] = static_cast<uint32_t>(address) & 0xfffffffc;
   packet.indirect_buffer[2] = static_cast<uint32_t>(address >> 32);
-  packet.indirect_buffer[3] = command_list->dwords() | kIbValid | kIbTemporalLu;
+  packet.indirect_buffer[3] =
+      command_list->dwords() | kIbValid | IbFetchHint(command_list->family());
   packet.dword_count_remaining = 10;
   packet.completion_signal = completion_signal;
 
