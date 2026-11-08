@@ -2495,7 +2495,6 @@ bool VirtualGPU::DispatchGraphPm4Batch(
       Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal);
 
   const uint32_t queue_mask = gpu_queue_->size - 1;
-  WaitForQueueSlot(index, queue_mask);
   TrackQueueProgress(packet, index);
   auto* slot = &reinterpret_cast<hsa_ext_amd_aql_pm4_packet_t*>(
       gpu_queue_->base_address)[index & queue_mask];
