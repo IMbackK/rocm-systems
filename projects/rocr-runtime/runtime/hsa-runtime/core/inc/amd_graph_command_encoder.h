@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <vector>
 
@@ -16,6 +17,51 @@
 #include "inc/hsa_ven_amd_graph.h"
 
 namespace rocr::graph {
+
+/*
+ * GFX9 dependency boundary width.
+ *
+ * The GFX11 reference lowers a same-agent RMW dependency to compute-idle plus
+ * ACQUIRE_MEM, and its GCR_CNTL actions ride the ME dispatch path, so the
+ * boundary is nearly free there.  GFX9 has no GCR_CNTL: the actions live in
+ * CP_COHER_CNTL, and on gfx908 the pair costs roughly 4.5 us per dispatch,
+ * which is 60% of throughput on a 1010-dispatch llama.cpp decode graph
+ * (246 tokens/s on ordinary AQL, 140 through a retained list).
+ *
+ * Three things about that boundary are measurable and none of them is obvious
+ * from the packet definitions:
+ *
+ *   - Only SH_KCACHE_ACTION_ENA and TCL1_ACTION_ENA are needed.  Dropping
+ *     SH_ICACHE_ACTION_ENA, TC_ACTION_ENA and TC_WB_ACTION_ENA keeps a
+ *     512-step non-atomic dependent RMW chain exact at 4 KiB, 256 KiB and
+ *     32 MiB working sets and takes 140 to 227 tokens/s.  TC together with
+ *     TC_WB is the degenerate combination Mesa deliberately splits into two
+ *     packets, and SH_ICACHE guards against code patching rather than against
+ *     another dispatch's writes.
+ *   - The two words must be emitted acquire-first.  GFX9 runs ACQUIRE_MEM in
+ *     the PFP, so an acquire placed after the producer dispatch overtakes it,
+ *     invalidates nothing, and the chain silently reads stale data.  With the
+ *     acquire first the ME retires it behind the producer in packet order, and
+ *     the compute-idle drain then keeps the PFP from starting the consumer
+ *     until the invalidate has landed.  Drain-first is also exact but lands at
+ *     227 instead of 244, and an acquire with no drain is simply broken.
+ *   - The drain is not redundant with the CP's own dispatch serialisation.  A
+ *     32 MiB working set shows the CP ordering the dispatches themselves
+ *     correctly with no boundary at all; the drain is there to order the
+ *     invalidate, and it is unavoidable.
+ *
+ * Net result is 244 tokens/s against the 246 tokens/s ordinary-AQL reference.
+ * HSA_GRAPH_PM4_CONSERVATIVE_FENCE=1 restores the wider CP_COHER_CNTL action
+ * set for fault isolation.  It never reorders the two packets, because the
+ * narrow ordering above is the correct one.
+ */
+inline bool ConservativeGfx9Fence() {
+  static const bool enable = [] {
+    const char* value = std::getenv("HSA_GRAPH_PM4_CONSERVATIVE_FENCE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enable;
+}
 
 struct GraphCommandCapability {
   hsa_ven_amd_graph_encoder_family_t family;
@@ -64,6 +110,10 @@ struct Gfx9KernelImage {
  *   - COMPUTE_DISPATCH_INITIATOR has no CS_W32_EN.  A plain compute dispatch is
  *     COMPUTE_SHADER_EN plus FORCE_START_AT_000 so COMPUTE_START_* left behind
  *     by another resident cannot shrink the grid.
+ *   - The CP_COHER_CNTL acquire is a synchronous CP-side operation rather than
+ *     a GCR action folded into the ME dispatch path, so its action set and its
+ *     ordering against the compute-idle drain both matter for throughput.  See
+ *     ConservativeGfx9Fence().
  */
 class Gfx9CommandEncoder {
  public:
@@ -97,10 +147,10 @@ class Gfx9CommandEncoder {
 
     if (dispatch_count_ != 0) {
       if (dependency == HSA_VEN_AMD_GRAPH_DEPENDENCY_SAME_AGENT_RMW) {
-        DependencyRmwSameAgent();
+        DependencyBoundary(DependencyCoherCntl());
       } else if (dependency == HSA_VEN_AMD_GRAPH_DEPENDENCY_VMEM_ONLY &&
                  (kernel_flags & HSA_VEN_AMD_GRAPH_KERNEL_VERIFIED_VMEM_ONLY) != 0) {
-        DependencyRmwVmem();
+        DependencyBoundary(kCoherCntlVmem);
       } else {
         return false;
       }
@@ -179,37 +229,44 @@ class Gfx9CommandEncoder {
   static constexpr uint16_t kSupportedKernelProperties =
       kEnableSgprPrivateSegmentBuffer | kEnableSgprKernargSegmentPtr;
   static constexpr uint32_t kDispatchInitiator = (1u << 0) | (1u << 2);
-  // CP_COHER_CNTL: SH_ICACHE | SH_KCACHE | TC | TCL1 | TC_WB.
+  // CP_COHER_CNTL actions a same-agent dependency boundary needs on GFX9:
+  // SH_KCACHE_ACTION_ENA drops the scalar constant cache and
+  // TCL1_ACTION_ENA drops the per-CU vector read cache.  See
+  // ConservativeGfx9Fence() for what the qualification sweep ruled out.
+  static constexpr uint32_t kCoherCntlDependency = (1u << 27) | (1u << 22);
+  // Narrowed boundary for a verified VMEM-only consumer: the vector read cache
+  // without the scalar constant cache action.
+  static constexpr uint32_t kCoherCntlVmem = (1u << 22);
+  // Debug-gate action set: SH_ICACHE | SH_KCACHE | TC | TCL1 | TC_WB.
   static constexpr uint32_t kCoherCntlFull =
       (1u << 29) | (1u << 27) | (1u << 23) | (1u << 22) | (1u << 18);
-  // Narrowed boundary for a verified VMEM-only consumer: the same L2/L1
-  // actions without the scalar constant cache invalidation.
-  static constexpr uint32_t kCoherCntlVmem = (1u << 23) | (1u << 22) | (1u << 18);
   static constexpr uint32_t kCoherSizeHi = 0x00ffffff;
   static constexpr uint32_t kCoherPollInterval = 10;
   // EVENT_TYPE CS_PARTIAL_FLUSH with EVENT_INDEX compute.
   static constexpr uint32_t kEventCsPartialFlush = (7u << 0) | (4u << 8);
+
+  static uint32_t DependencyCoherCntl() {
+    static const uint32_t mask = ConservativeGfx9Fence() ? kCoherCntlFull
+                                                         : kCoherCntlDependency;
+    return mask;
+  }
 
   static uint32_t Packet3(uint32_t opcode, uint32_t body_dwords, bool compute) {
     return (3u << 30) | ((body_dwords - 1) << 16) | (opcode << 8) |
            (compute ? 1u << 1 : 0);
   }
 
-  void AcquireSystem() { EmitAcquire(kCoherCntlFull); }
+  void AcquireSystem() { EmitAcquire(DependencyCoherCntl()); }
 
   void WaitComputeIdle() {
     words_.push_back(Packet3(kPacket3EventWrite, 1, false));
     words_.push_back(kEventCsPartialFlush);
   }
 
-  void DependencyRmwSameAgent() {
+  // Acquire first, drain second: see ConservativeGfx9Fence().
+  void DependencyBoundary(uint32_t coher_cntl) {
+    EmitAcquire(coher_cntl);
     WaitComputeIdle();
-    EmitAcquire(kCoherCntlFull);
-  }
-
-  void DependencyRmwVmem() {
-    WaitComputeIdle();
-    EmitAcquire(kCoherCntlVmem);
   }
 
   void EmitAcquire(uint32_t coher_cntl) {

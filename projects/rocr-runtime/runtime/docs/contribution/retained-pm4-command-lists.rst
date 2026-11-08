@@ -182,19 +182,43 @@ kernel metadata proves the consumer's cache class. Unknown metadata always
 uses the fail-closed scalar/vector boundary.
 
 GFX9 has no GCR_CNTL field: its ACQUIRE_MEM selects actions through
-CP_COHER_CNTL and its CP_COHER_SIZE_HI is 24 bits wide. The accepted GFX9
-boundary keeps the same shape:
+CP_COHER_CNTL and its CP_COHER_SIZE_HI is 24 bits wide. The GFX9 boundary does
+not keep the GFX11 shape, because on GFX9 the pair is a synchronous CP-side
+operation rather than an action folded into the ME dispatch path. The accepted
+GFX9 boundary is:
 
-1. ``CS_PARTIAL_FLUSH`` / compute-idle;
-2. ``ACQUIRE_MEM`` with ``SH_ICACHE|SH_KCACHE|TC|TCL1|TC_WB``;
+1. ``ACQUIRE_MEM`` with ``SH_KCACHE|TCL1``;
+2. ``CS_PARTIAL_FLUSH`` / compute-idle;
 3. the consumer dispatch.
 
-The narrowed VMEM-only variant drops the two shader-cache actions and keeps
-``TC|TCL1|TC_WB``. GFX9 lists must never carry the GFX11 GCR words, and the
-RSRC3 write is omitted rather than written as zero, because window offset
-``0x228`` is ``COMPUTE_STATIC_THREAD_MGMT_SE7`` on GFX9 and would mask shader
-engines. Wave32 mode does not exist on GFX9, so a kernel declaring it falls
-back instead of being dispatched as wave64.
+The order of the first two words is load-bearing in both directions. GFX9
+executes ACQUIRE_MEM in the PFP, so an acquire emitted after the producer
+dispatch overtakes it and invalidates nothing: with the drain first and the
+acquire second the chain is exact, and with the acquire alone the chain reads
+stale data. Emitting the acquire first lets the ME retire it behind the
+producer in packet order while the drain still prevents the PFP from starting
+the consumer before the invalidate has landed.
+
+The action set is the narrowest one that stays exact. ``SH_ICACHE_ACTION_ENA``
+guards against code patching rather than against another dispatch's writes, and
+``TC_ACTION_ENA`` with ``TC_WB_ACTION_ENA`` is the degenerate combination that
+the Mesa GFX9 surface-sync path deliberately splits into two packets. The
+narrowed VMEM-only variant keeps ``TCL1`` alone.
+
+Measured on gfx908 with a 1010-dispatch llama.cpp decode graph, the GFX11-shaped
+boundary ran 140 tokens/s against an ordinary-AQL reference of 246. Narrowing
+the action set reached 227 and reordering the two words reached 244. A
+32 MiB-working-set variant of the dependency chain is exact with no boundary at
+all, which shows that the CP already orders the dispatches themselves and that
+the drain is present only to order the invalidate.
+
+GFX9 lists must never carry the GFX11 GCR words, and the RSRC3 write is omitted
+rather than written as zero, because window offset ``0x228`` is
+``COMPUTE_STATIC_THREAD_MGMT_SE7`` on GFX9 and would mask shader engines.
+Wave32 mode does not exist on GFX9, so a kernel declaring it falls back instead
+of being dispatched as wave64. ``HSA_GRAPH_PM4_CONSERVATIVE_FENCE=1`` restores
+the wider CP_COHER_CNTL action set for fault isolation without reordering the
+two words.
 
 Target ROCR abstraction
 -----------------------
