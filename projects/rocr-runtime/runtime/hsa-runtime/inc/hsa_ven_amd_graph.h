@@ -22,8 +22,10 @@ typedef struct hsa_ven_amd_graph_command_list_s {
 
 typedef enum hsa_ven_amd_graph_encoder_family_s {
   HSA_VEN_AMD_GRAPH_ENCODER_NONE = 0,
-  HSA_VEN_AMD_GRAPH_ENCODER_GFX11 = 1,
-  HSA_VEN_AMD_GRAPH_ENCODER_GFX12 = 2,
+  HSA_VEN_AMD_GRAPH_ENCODER_GFX9 = 1,
+  HSA_VEN_AMD_GRAPH_ENCODER_GFX10 = 2,
+  HSA_VEN_AMD_GRAPH_ENCODER_GFX11 = 3,
+  HSA_VEN_AMD_GRAPH_ENCODER_GFX12 = 4,
 } hsa_ven_amd_graph_encoder_family_t;
 
 typedef enum hsa_ven_amd_graph_capability_flag_s {

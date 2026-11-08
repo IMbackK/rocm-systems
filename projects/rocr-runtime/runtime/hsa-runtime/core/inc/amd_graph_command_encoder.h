@@ -25,8 +25,11 @@ struct GraphCommandCapability {
 
 inline GraphCommandCapability GetGraphCommandCapability(uint32_t major, uint32_t minor,
                                                         uint32_t stepping) {
+  if (major == 9) {
+    return {HSA_VEN_AMD_GRAPH_ENCODER_GFX9, true, true};
+  }
   if (major == 11) {
-    return {HSA_VEN_AMD_GRAPH_ENCODER_GFX11, true, minor == 5 && stepping == 1};
+    return {HSA_VEN_AMD_GRAPH_ENCODER_GFX11, true, true};
   }
   if (major == 12) {
     return {HSA_VEN_AMD_GRAPH_ENCODER_GFX12, minor == 0, false};

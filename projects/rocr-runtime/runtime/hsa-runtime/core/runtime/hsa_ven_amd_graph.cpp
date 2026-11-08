@@ -329,7 +329,8 @@ hsa_status_t Create(hsa_agent_t hsa_agent,
   uint32_t private_wave32 = 0;
   uint32_t private_wave64 = 0;
   constexpr uint16_t kEnableWavefrontSize32 = 1u << 10;
-  if (capabilities.encoder_family == HSA_VEN_AMD_GRAPH_ENCODER_GFX11) {
+  if (capabilities.encoder_family == HSA_VEN_AMD_GRAPH_ENCODER_GFX9) {
+  } else if (capabilities.encoder_family == HSA_VEN_AMD_GRAPH_ENCODER_GFX11) {
     Gfx11CommandEncoder builder;
     for (size_t i = 0; i < desc->packet_count; ++i) {
       const auto& packet = desc->packets[i];
