@@ -251,6 +251,24 @@ release(bool, DEBUG_HIP_GRAPH_PM4, false,                                    \
         "Lower supported single-stream graph batches to retained PM4")       \
 release(bool, DEBUG_HIP_GRAPH_PM4_UNQUALIFIED, false,                        \
         "Allow retained PM4 on compile-supported but unqualified ASICs")    \
+release(bool, DEBUG_HIP_GRAPH_PM4_ALL_BARRIERS, false,                       \
+        "Force a blanket same-agent RMW boundary on every retained PM4 edge, " \
+        "disabling the memory dependency classifier")                        \
+release(bool, DEBUG_HIP_GRAPH_PM4_FORCE_NONE, false,                         \
+        "Force every retained PM4 edge to dependency-none. Numerically wrong " \
+        "by design; measures the no-boundary ceiling only")                  \
+release(bool, DEBUG_HIP_GRAPH_PM4_CLASSIFY_STATS, false,                     \
+        "Print the retained PM4 edge classification histogram per batch")   \
+release(uint, DEBUG_HIP_GRAPH_PM4_MIN_NONE_PERCENT, 50,                      \
+        "GFX9 only: replay through AQL unless the classifier removes at least " \
+        "this percent of the edges. On GFX9 a kept boundary is a PFP drain, so " \
+        "a retained list that removes nothing costs more than an AQL packet. "  \
+        "GFX11 and GFX12 keep their lists regardless, because there the "       \
+        "boundary rides the ME dispatch path. 0 disables the check on GFX9")   \
+release(bool, DEBUG_HIP_GRAPH_PM4_WRAPPER_AGENT, false,                      \
+        "Materialise the retained PM4 wrapper at agent instead of system "    \
+        "fence scope. Only sound when no host transfer and no other agent is " \
+        "in the chain, which the call site cannot tell")                      \
 release(uint, DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING, 0,                          \
         "Segment scheduling mode (segmented path only): "                      \
         "0=Hybrid/auto, 1=Round-robin, 2=DFS")                                \

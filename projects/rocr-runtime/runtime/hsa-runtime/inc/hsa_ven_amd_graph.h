@@ -14,7 +14,7 @@ extern "C" {
 #endif
 
 #define HSA_VEN_AMD_GRAPH_VERSION_MAJOR 0
-#define HSA_VEN_AMD_GRAPH_VERSION_MINOR 3
+#define HSA_VEN_AMD_GRAPH_VERSION_MINOR 4
 
 typedef struct hsa_ven_amd_graph_command_list_s {
   uint64_t handle;
@@ -31,6 +31,10 @@ typedef enum hsa_ven_amd_graph_encoder_family_s {
 typedef enum hsa_ven_amd_graph_capability_flag_s {
   HSA_VEN_AMD_GRAPH_CAPABILITY_COMPILE_SUPPORTED = 1u << 0,
   HSA_VEN_AMD_GRAPH_CAPABILITY_RUNTIME_QUALIFIED = 1u << 1,
+  // The encoder accepts HSA_VEN_AMD_GRAPH_DEPENDENCY_NONE.  Callers must not send
+  // that value until they have seen this bit, so an older runtime keeps seeing only
+  // the two values it knows.
+  HSA_VEN_AMD_GRAPH_CAPABILITY_DEPENDENCY_NONE = 1u << 2,
 } hsa_ven_amd_graph_capability_flag_t;
 
 typedef struct hsa_ven_amd_graph_capabilities_s {
@@ -42,14 +46,31 @@ typedef struct hsa_ven_amd_graph_capabilities_s {
   uint32_t reserved[3];
 } hsa_ven_amd_graph_capabilities_t;
 
+// Dependency carried by the edge that precedes a dispatch.  The value at index i
+// describes what the encoder must insert between dispatch i-1 and dispatch i.
 typedef enum hsa_ven_amd_graph_dependency_s {
+  // The previous dispatch may have written device memory this one reads or writes.
+  // The encoder emits a full same-agent read-modify-write boundary.
   HSA_VEN_AMD_GRAPH_DEPENDENCY_SAME_AGENT_RMW = 0,
+  // The only overlap is through vector memory operations, never a scalar load, so
+  // the scalar constant cache does not have to be dropped.  Requires
+  // HSA_VEN_AMD_GRAPH_KERNEL_VERIFIED_VMEM_ONLY on the consumer.
   HSA_VEN_AMD_GRAPH_DEPENDENCY_VMEM_ONLY = 1,
+  // The caller asserts there is no data dependency through device memory between
+  // the previous dispatch and this one.  The encoder emits nothing between them:
+  // no cache invalidate and no compute-idle drain.  Requires
+  // HSA_VEN_AMD_GRAPH_CAPABILITY_DEPENDENCY_NONE.
+  HSA_VEN_AMD_GRAPH_DEPENDENCY_NONE = 2,
 } hsa_ven_amd_graph_dependency_t;
 
 typedef enum hsa_ven_amd_graph_kernel_flag_s {
   HSA_VEN_AMD_GRAPH_KERNEL_DYNAMIC_CALLSTACK = 1u << 0,
   HSA_VEN_AMD_GRAPH_KERNEL_VERIFIED_VMEM_ONLY = 1u << 1,
+  // The consumer performs a scalar load of global memory, so a boundary in front of
+  // it must also drop the scalar constant cache.  A caller that knows the consumer
+  // only performs vector loads may leave this clear to let the runtime downgrade a
+  // same-agent RMW edge to VMEM_ONLY itself.
+  HSA_VEN_AMD_GRAPH_KERNEL_SCALAR_READS_GLOBAL = 1u << 2,
 } hsa_ven_amd_graph_kernel_flag_t;
 
 typedef enum hsa_ven_amd_graph_command_list_flag_s {

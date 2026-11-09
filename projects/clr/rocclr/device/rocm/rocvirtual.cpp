@@ -2354,11 +2354,11 @@ class RocrGraphPm4Batch final : public amd::device::GraphPm4Batch {
 
   const Device& device() const { return device_; }
 
-  bool Materialize(hsa_queue_t* queue,
+  bool Materialize(hsa_queue_t* queue, hsa_fence_scope_t acquire, hsa_fence_scope_t release,
                    hsa_ven_amd_graph_materialized_packet_t* packet) const {
     return Hsa::amd_graph_command_list_materialize_packet(
-               command_list_, queue, HSA_FENCE_SCOPE_SYSTEM, HSA_FENCE_SCOPE_SYSTEM, 1,
-               hsa_signal_t{0}, packet) == HSA_STATUS_SUCCESS;
+               command_list_, queue, acquire, release, 1, hsa_signal_t{0}, packet) ==
+           HSA_STATUS_SUCCESS;
   }
 
  private:
@@ -2367,6 +2367,167 @@ class RocrGraphPm4Batch final : public amd::device::GraphPm4Batch {
 };
 
 }  // namespace
+
+// Why a node's footprint could not be resolved. Diagnostic only: any bit forces the node's
+// edges to a boundary.
+enum Pm4UnknownReason {
+  kPm4UnknownScratch = 1u << 0,
+  kPm4UnknownPointerSize = 1u << 1,
+  kPm4UnknownArgOffset = 1u << 2,
+  kPm4UnknownAllocation = 1u << 3,
+};
+
+// ================================================================================================
+// Device-memory footprint of one captured dispatch, recovered from the AQL packet.
+//
+// The retained PM4 path classifies edges long after capture, from the packet array alone, so
+// the global-memory arguments are read back out of the kernarg buffer each packet points at and
+// resolved to the allocation that contains them. Every argument counts as both a read and a
+// write: with no per-kernel write set the only sound statement available is "these two dispatches
+// touch no allocation in common".
+//
+// |unknown| is set when an argument cannot be resolved. Callers must read that as a dependency:
+// a classifier that is too aggressive produces wrong numerics rather than a fault.
+class Pm4NodeFootprint {
+ public:
+  void add(uint64_t start, uint64_t end) {
+    if (start < end) ranges_.emplace_back(start, end);
+  }
+  void mark_unknown() {
+    unknown_ = true;
+    ranges_.clear();
+  }
+  bool unknown() const { return unknown_; }
+  const std::vector<std::pair<uint64_t, uint64_t>>& ranges() const { return ranges_; }
+
+ private:
+  std::vector<std::pair<uint64_t, uint64_t>> ranges_;
+  bool unknown_ = false;
+};
+
+// Everything touched since the last emitted boundary, the same window the AQL path's
+// MemoryDependency keeps. Kept sorted and merged so an overlap probe is a binary search and a
+// graph whose nodes all share one arena costs one entry.
+class Pm4RangeWindow {
+ public:
+  bool overlaps(uint64_t start, uint64_t end) const {
+    // First entry with second > start; it overlaps iff its first < end.
+    size_t lo = 0;
+    size_t hi = ranges_.size();
+    while (lo < hi) {
+      const size_t mid = lo + (hi - lo) / 2;
+      if (ranges_[mid].second <= start) lo = mid + 1; else hi = mid;
+    }
+    return lo < ranges_.size() && ranges_[lo].first < end;
+  }
+
+  void insert(uint64_t start, uint64_t end) {
+    if (start >= end) return;
+    const size_t pos = std::lower_bound(ranges_.begin(), ranges_.end(),
+                                        std::make_pair(start, end)) - ranges_.begin();
+    ranges_.insert(ranges_.begin() + pos, {start, end});
+    mergeAt(pos);
+  }
+
+  void absorb(const Pm4NodeFootprint& node) {
+    for (const auto& r : node.ranges()) insert(r.first, r.second);
+  }
+
+  void reset(const Pm4NodeFootprint& node) {
+    ranges_.clear();
+    absorb(node);
+    std::sort(ranges_.begin(), ranges_.end());
+    for (size_t i = ranges_.empty() ? 0 : 1; i < ranges_.size();) {
+      if (ranges_[i].first <= ranges_[i - 1].second) {
+        ranges_[i - 1].second = std::max(ranges_[i - 1].second, ranges_[i].second);
+        ranges_.erase(ranges_.begin() + i);
+      } else {
+        ++i;
+      }
+    }
+  }
+
+ private:
+  void mergeAt(size_t pos) {
+    while (pos + 1 < ranges_.size() && ranges_[pos + 1].first <= ranges_[pos].second) {
+      ranges_[pos].second = std::max(ranges_[pos].second, ranges_[pos + 1].second);
+      ranges_.erase(ranges_.begin() + pos + 1);
+    }
+    if (pos > 0 && ranges_[pos - 1].second >= ranges_[pos].first) {
+      ranges_[pos - 1].second = std::max(ranges_[pos - 1].second, ranges_[pos].second);
+      ranges_.erase(ranges_.begin() + pos);
+    }
+  }
+
+  std::vector<std::pair<uint64_t, uint64_t>> ranges_;
+};
+
+// Resolves an argument pointer to the extent of the allocation holding it. The whole allocation
+// is used rather than the argument's own footprint, because the runtime cannot see how far the
+// kernel walks from the base it was handed.
+static bool ResolveArgExtent(const Device& dev, const void* ptr, uint64_t* start, uint64_t* end) {
+  size_t offset = 0;
+  amd::Memory* mem = amd::MemObjMap::FindMemObj(ptr, &offset, const_cast<Device*>(&dev));
+  if (mem == nullptr) {
+    return false;
+  }
+  const size_t size = (mem->getMemFlags() & ROCCLR_MEM_PHYMEM)
+                          ? sizeof(mem->getUserData().hsa_handle)
+                          : mem->getSize();
+  *start = reinterpret_cast<uintptr_t>(ptr) - offset;
+  *end = *start + size;
+  return true;
+}
+
+static void CollectNodeFootprint(const Device& dev, const roc::Kernel& gpuKernel,
+                                 const hsa_kernel_dispatch_packet_t& packet,
+                                 Pm4NodeFootprint& footprint, unsigned& reasons) {
+  // Private segments live in a per-queue scratch area the next dispatch reuses, so a kernel
+  // that spills shares an unmodelled region with its neighbours.
+  if (packet.private_segment_size != 0) {
+    footprint.mark_unknown();
+    reasons |= kPm4UnknownScratch;
+    return;
+  }
+  const uint8_t* kernargs = static_cast<const uint8_t*>(packet.kernarg_address);
+  if (kernargs == nullptr) {
+    return;
+  }
+  const amd::KernelSignature& signature = gpuKernel.signature();
+  const size_t argSize = gpuKernel.KernargSegmentByteSize();
+  for (uint32_t i = 0; i < signature.numParameters(); ++i) {
+    const amd::KernelParameterDescriptor& desc = signature.at(i);
+    if (desc.type_ != T_POINTER) {
+      continue;
+    }
+    // Local data share is per workgroup and cannot carry data between dispatches.
+    if (desc.addressQualifier_ == CL_KERNEL_ARG_ADDRESS_LOCAL) {
+      continue;
+    }
+    if (desc.size_ != sizeof(uintptr_t)) {
+      footprint.mark_unknown();
+      reasons |= kPm4UnknownPointerSize;
+      continue;
+    }
+    if (desc.offset_ + desc.size_ > argSize) {
+      footprint.mark_unknown();
+      reasons |= kPm4UnknownArgOffset;
+      continue;
+    }
+    const void* ptr = *reinterpret_cast<const void* const*>(kernargs + desc.offset_);
+    if (ptr == nullptr) {
+      continue;
+    }
+    uint64_t start = 0;
+    uint64_t end = 0;
+    if (!ResolveArgExtent(dev, ptr, &start, &end)) {
+      footprint.mark_unknown();
+      reasons |= kPm4UnknownAllocation;
+      continue;
+    }
+    footprint.add(start, end);
+  }
+}
 
 std::shared_ptr<amd::device::GraphPm4Batch> VirtualGPU::CreateGraphPm4Batch(
     const amd::AlignedVector64<uint8_t>& flatPacketData,
@@ -2388,8 +2549,22 @@ std::shared_ptr<amd::device::GraphPm4Batch> VirtualGPU::CreateGraphPm4Batch(
     return nullptr;
   }
 
+  const bool allow_dependency_none =
+      (capabilities.flags & HSA_VEN_AMD_GRAPH_CAPABILITY_DEPENDENCY_NONE) != 0;
+  // Measures the no-boundary ceiling. Deliberately unsound: it asserts every edge is
+  // dependency-free, so a chain that really does alias reads stale data.
+  const bool force_none = DEBUG_HIP_GRAPH_PM4_FORCE_NONE && allow_dependency_none;
+  // Note that this does not consult MemoryDependency. HIP sets GPU_NUM_MEM_DEPENDENCY to 0 in
+  // hip::init() (hipamd/src/hip_context.cpp), so the AQL tracker is never active on this path and
+  // every captured header carries the barrier bit. The footprint analysis below is self-contained
+  // and is the only dependency information the retained list can get.
+  const bool classify = !DEBUG_HIP_GRAPH_PM4_ALL_BARRIERS && !force_none;
+
   std::vector<hsa_kernel_dispatch_packet_t> packets(validFullHeaders.size());
   std::vector<uint32_t> kernel_flags(validFullHeaders.size(), 0);
+  std::vector<Pm4NodeFootprint> footprints(validFullHeaders.size());
+  std::vector<uint8_t> captured_barrier(validFullHeaders.size(), 0);
+  unsigned unknownReasons = 0;
   std::vector<hsa_ven_amd_graph_dependency_t> dependencies(
       validFullHeaders.size() - 1, HSA_VEN_AMD_GRAPH_DEPENDENCY_SAME_AGENT_RMW);
   for (size_t i = 0; i < validFullHeaders.size(); ++i) {
@@ -2414,6 +2589,104 @@ std::shared_ptr<amd::device::GraphPm4Batch> VirtualGPU::CreateGraphPm4Batch(
     if (kernel_it->second.KernalHasDynamicCallStack()) {
       kernel_flags[i] |= HSA_VEN_AMD_GRAPH_KERNEL_DYNAMIC_CALLSTACK;
     }
+    captured_barrier[i] = ((header & kBarrierBit) != 0) ? 1 : 0;
+    if (classify) {
+      CollectNodeFootprint(dev(), kernel_it->second, packets[i], footprints[i], unknownReasons);
+    }
+  }
+
+  // Edge classification.
+  //
+  // A segment is a linear sequence on one queue, so an edge needs a boundary when the dispatch
+  // on its far side touches anything written since the last boundary - not merely what the
+  // immediately preceding dispatch touched. That is the same window the AQL path's
+  // MemoryDependency maintains; here it is rebuilt over the retained sequence, which is the
+  // sequence that will actually execute.
+  //
+  // Every argument counts as a writer, so this is strictly more conservative than the tracker,
+  // which consults the per-argument read-only flag. Unknown extents, scratch use and pointers
+  // that resolve to no allocation all force a boundary.
+  size_t footprintNone = 0;
+  size_t rmw = 0;
+  if (force_none) {
+    std::fill(dependencies.begin(), dependencies.end(), HSA_VEN_AMD_GRAPH_DEPENDENCY_NONE);
+  } else if (classify && allow_dependency_none) {
+    Pm4RangeWindow window;
+    bool windowUnknown = footprints[0].unknown();
+    if (!windowUnknown) {
+      window.reset(footprints[0]);
+    }
+    for (size_t i = 1; i < validFullHeaders.size(); ++i) {
+      bool needsBoundary = windowUnknown || footprints[i].unknown();
+      if (!needsBoundary) {
+        for (const auto& r : footprints[i].ranges()) {
+          if (window.overlaps(r.first, r.second)) {
+            needsBoundary = true;
+            break;
+          }
+        }
+      }
+      if (needsBoundary) {
+        ++rmw;
+        windowUnknown = footprints[i].unknown();
+        if (!windowUnknown) {
+          window.reset(footprints[i]);
+        }
+      } else {
+        dependencies[i - 1] = HSA_VEN_AMD_GRAPH_DEPENDENCY_NONE;
+        ++footprintNone;
+        window.absorb(footprints[i]);
+      }
+    }
+  } else {
+    rmw = dependencies.size();
+  }
+  if (DEBUG_HIP_GRAPH_PM4_CLASSIFY_STATS) {
+    size_t headerBarrier = 0;
+    for (uint8_t b : captured_barrier) headerBarrier += (b != 0) ? 1 : 0;
+    // Echoed so a measurement log can never be read with the wrong recipe attached to it.
+    const char* boundary = getenv("HSA_GRAPH_PM4_GFX9_BOUNDARY");
+    const char* coher = getenv("HSA_GRAPH_PM4_GFX9_COHER");
+    const char* range = getenv("HSA_GRAPH_PM4_GFX9_RANGE");
+    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+            "[hipGraph][PM4] %zu nodes: %zu none (disjoint from the window), %zu same-agent RMW;"
+            " %zu nodes carried a captured barrier bit; unknown=0x%x"
+            " (scratch=%d ptrsize=%d argoff=%d alloc=%d) boundary=%s coher=%s range=%s",
+            validFullHeaders.size(), footprintNone, rmw, headerBarrier, unknownReasons,
+            (unknownReasons & kPm4UnknownScratch) != 0,
+            (unknownReasons & kPm4UnknownPointerSize) != 0,
+            (unknownReasons & kPm4UnknownArgOffset) != 0,
+            (unknownReasons & kPm4UnknownAllocation) != 0,
+            (boundary != nullptr) ? boundary : "(default da)",
+            (coher != nullptr) ? coher : "(default)", (range != nullptr) ? range : "(default)");
+  }
+
+  // A retained list is not a free win on every family. Per dispatch it costs 8 dwords of
+  // DISPATCH_DIRECT plus about 11 of register setup, and 9 more on every edge that keeps a
+  // boundary, against the 16 dwords of the AQL packet whose barrier the ME handles inline. On
+  // GFX9 a kept boundary is a PFP-level drain, so with nothing to remove the retained form
+  // measured 3-5% slower than AQL on llama.cpp decode and the list is only built when the
+  // classifier removes a worthwhile share of the edges.
+  //
+  // Scoped to GFX9 on purpose. On GFX11 and GFX12 the retained list wins outright: on a
+  // 319-dispatch graph, us per dispatch, gfx1100 measured 2.51 AQL against 0.74 with every edge
+  // keeping a boundary, and gfx1201 2.44 against 0.66. Falling back there would give up the
+  // advantage for exactly the graphs that benefit most. The boundaries are still worth removing
+  // on those families - the same graph with 63 of 318 edges measured 0.36 and 0.27 - so the
+  // classifier matters everywhere; only the fallback decision is family-dependent.
+  const bool family_must_remove_edges =
+      capabilities.encoder_family == HSA_VEN_AMD_GRAPH_ENCODER_GFX9;
+  const size_t edges = footprintNone + rmw;
+  if (family_must_remove_edges && classify && !force_none &&
+      DEBUG_HIP_GRAPH_PM4_MIN_NONE_PERCENT > 0 &&
+      edges * DEBUG_HIP_GRAPH_PM4_MIN_NONE_PERCENT > footprintNone * 100) {
+    if (DEBUG_HIP_GRAPH_PM4_CLASSIFY_STATS) {
+      ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+              "[hipGraph][PM4] %zu of %zu edges dependency-none is below the %u%% floor:"
+              " replaying this batch as AQL",
+              footprintNone, edges, DEBUG_HIP_GRAPH_PM4_MIN_NONE_PERCENT);
+    }
+    return nullptr;
   }
 
   hsa_ven_amd_graph_command_list_desc_t desc{};
@@ -2467,12 +2740,22 @@ bool VirtualGPU::DispatchGraphPm4Batch(
     return false;
   }
 
+  std::scoped_lock lock(execution());
+
+  // The wrapper is the only entry acquire and exit release a retained list gets. It stays at
+  // system scope by default: neither AccumulateCommand::getCommandEntryScope() nor anything else
+  // at this call site reports whether a host transfer or another agent is in the chain, and on
+  // llama.cpp decode the batch's neighbours are exactly that - the token and position uploads
+  // before it and the logits readback after it. DEBUG_HIP_GRAPH_PM4_WRAPPER_AGENT narrows it to
+  // agent for measurement. Measured on GFX9 the scope is worth nothing: clamping the wrapper to
+  // NONE/NONE did not move launch latency.
+  const hsa_fence_scope_t wrapperScope = DEBUG_HIP_GRAPH_PM4_WRAPPER_AGENT ? HSA_FENCE_SCOPE_AGENT
+                                                                           : HSA_FENCE_SCOPE_SYSTEM;
   hsa_ven_amd_graph_materialized_packet_t materialized{};
-  if (!retained->Materialize(gpu_queue_, &materialized)) {
+  if (!retained->Materialize(gpu_queue_, wrapperScope, wrapperScope, &materialized)) {
     return false;
   }
 
-  std::scoped_lock lock(execution());
   profilingBegin(*vcmd);
   dispatchBlockingWait(nullptr);
   hsa_ext_amd_aql_pm4_packet_t packet{};
@@ -2487,9 +2770,13 @@ bool VirtualGPU::DispatchGraphPm4Batch(
   RecordAqlPacketHeader(reservation, 0, header);
   CompleteAqlSubmission(reservation);
 
+  // Tracks the scope the wrapper above actually released at. adjustHeader() suppresses a later
+  // flush when it believes the queue already released at system scope, so an agent wrapper must
+  // not leave the queue recorded as system-clean.
   ClearStateFlag(kAddSystemScope);
-  fence_state_ = amd::Device::kCacheStateSystem;
-  setFenceDirty(false);
+  fence_state_ = (wrapperScope == HSA_FENCE_SCOPE_SYSTEM) ? amd::Device::kCacheStateSystem
+                                                          : amd::Device::kCacheStateAgent;
+  setFenceDirty(wrapperScope != HSA_FENCE_SCOPE_SYSTEM);
   const bool attachSignal = timestamp_ != nullptr || attach_signal || blocking;
   packet.completion_signal =
       Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal);

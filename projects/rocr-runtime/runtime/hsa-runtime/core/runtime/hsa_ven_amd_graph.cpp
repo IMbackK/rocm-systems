@@ -190,6 +190,10 @@ bool GetCapability(AMD::GpuAgent* agent, hsa_ven_amd_graph_capabilities_t* capab
   if (capability.runtime_qualified) {
     capabilities->flags |= HSA_VEN_AMD_GRAPH_CAPABILITY_RUNTIME_QUALIFIED;
   }
+  // Every encoder family here understands a dependency-free edge: the boundary is
+  // simply not emitted.  Keep this next to the family table so a family that ever
+  // needs a mandatory per-dispatch action drops the bit rather than lying about it.
+  capabilities->flags |= HSA_VEN_AMD_GRAPH_CAPABILITY_DEPENDENCY_NONE;
   return true;
 }
 
@@ -349,6 +353,15 @@ hsa_status_t Create(hsa_agent_t hsa_agent,
   };
   std::vector<uint32_t> words;
   uint32_t dispatch_count = 0;
+  // Reject an out-of-range dependency before the encoder sees it.  The encoder's own
+  // else-return already fails closed, but a bad value here is a caller bug worth
+  // naming instead of reporting as an invalid code object.
+  for (size_t i = 0; i < desc->dependency_count; ++i) {
+    const uint32_t value = static_cast<uint32_t>(desc->dependencies[i]);
+    if (value > HSA_VEN_AMD_GRAPH_DEPENDENCY_NONE) {
+      return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    }
+  }
   size_t tmpring_patch_dword = static_cast<size_t>(-1);
   uint32_t private_wave32 = 0;
   uint32_t private_wave64 = 0;

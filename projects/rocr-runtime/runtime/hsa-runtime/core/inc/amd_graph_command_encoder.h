@@ -21,39 +21,61 @@ namespace rocr::graph {
 /*
  * GFX9 dependency boundary width.
  *
- * The GFX11 reference lowers a same-agent RMW dependency to compute-idle plus
- * ACQUIRE_MEM, and its GCR_CNTL actions ride the ME dispatch path, so the
- * boundary is nearly free there.  GFX9 has no GCR_CNTL: the actions live in
- * CP_COHER_CNTL, and on gfx908 the pair costs roughly 4.5 us per dispatch,
- * which is 60% of throughput on a 1010-dispatch llama.cpp decode graph
- * (246 tokens/s on ordinary AQL, 140 through a retained list).
+ * Every family lowers a same-agent RMW dependency to compute-idle plus
+ * ACQUIRE_MEM.  GFX9 has no GCR_CNTL: the actions live in CP_COHER_CNTL, so the
+ * pair is a PFP-level drain instead of a GCR override riding the ME dispatch
+ * path, and that difference decides whether a retained list is worth building.
  *
- * Three things about that boundary are measurable and none of them is obvious
- * from the packet definitions:
+ * Measured on a 319-dispatch graph, us per dispatch, interleaved runs, against
+ * ordinary AQL on the same binary:
+ *
+ *   family    device          AQL    all 318 edges RMW    63 of 318 RMW
+ *   gfx908    MI100          1.365              1.505            0.462
+ *   gfx1100   RX 7900 XTX    2.509              0.741            0.359
+ *   gfx1201   RX 9070        2.440              0.659            0.272
+ *
+ * Two corrections to the assumptions this file was written against.
+ *
+ * The boundary is not nearly free on GFX11 and GFX12.  ACQUIRE_MEM is still one
+ * packet per edge there; only its action set is spelled as GCR_CNTL.  Removing
+ * 255 of 318 boundaries from the same graph is worth 1.9x on gfx1100 and 2.3x
+ * on gfx1201.  The retained list does still beat AQL with every edge kept,
+ * which is why the caller's "replay as AQL when the classifier removed nothing"
+ * policy is scoped to GFX9 and not applied here.
+ *
+ * The drain is not redundant with the CP's own dispatch handling, and it is not
+ * a cache concern either.  A producer that spins before writing, feeding a
+ * consumer that reads a buffer no kernel has ever read (so no cache line of it
+ * can be stale), observes the consumer running the full spin early with no
+ * boundary at all.  Measured on gfx908 and gfx1100; gfx1201 happened to stay
+ * ordered.  The CP starts DISPATCH_DIRECT packets without waiting for the
+ * previous one to retire, so the drain is the only thing ordering the
+ * dispatches themselves, and DEPENDENCY_NONE asserts only the absence of a data
+ * dependency.  It must not be read as a statement about execution order.
+ *
+ * Two further things about the GFX9 boundary are not obvious from the packet
+ * definitions:
  *
  *   - Only SH_KCACHE_ACTION_ENA and TCL1_ACTION_ENA are needed.  Dropping
  *     SH_ICACHE_ACTION_ENA, TC_ACTION_ENA and TC_WB_ACTION_ENA keeps a
  *     512-step non-atomic dependent RMW chain exact at 4 KiB, 256 KiB and
- *     32 MiB working sets and takes 140 to 227 tokens/s.  TC together with
- *     TC_WB is the degenerate combination Mesa deliberately splits into two
- *     packets, and SH_ICACHE guards against code patching rather than against
- *     another dispatch's writes.
- *   - The two words must be emitted acquire-first.  GFX9 runs ACQUIRE_MEM in
- *     the PFP, so an acquire placed after the producer dispatch overtakes it,
- *     invalidates nothing, and the chain silently reads stale data.  With the
- *     acquire first the ME retires it behind the producer in packet order, and
- *     the compute-idle drain then keeps the PFP from starting the consumer
- *     until the invalidate has landed.  Drain-first is also exact but lands at
- *     227 instead of 244, and an acquire with no drain is simply broken.
- *   - The drain is not redundant with the CP's own dispatch serialisation.  A
- *     32 MiB working set shows the CP ordering the dispatches themselves
- *     correctly with no boundary at all; the drain is there to order the
- *     invalidate, and it is unavoidable.
+ *     32 MiB working sets.  A consumer that provably never issues a scalar load
+ *     of global memory needs TCL1_ACTION_ENA alone, which is the cheaper half:
+ *     0.83 us per dispatch against 1.14 us for the pair, measured on the
+ *     512-node slope.  Adding TC_ACTION_ENA makes the chain read stale data at
+ *     small working sets, so it stays out.
+ *   - The drain must come first.  GFX9 runs ACQUIRE_MEM in the PFP, which does
+ *     not wait for the ME, so an acquire placed in front of the drain overtakes
+ *     the producer, invalidates a cache the producer has not finished dirtying,
+ *     and the chain silently reads stale values.  Measured on the 512-step
+ *     chain at 16 KiB, 128 KiB, 256 KiB and 2 MiB: acquire-then-drain corrupts
+ *     every vector, scalar and read-only flavour, drain-then-acquire is exact.
+ *     Acquire-then-drain is also the cheaper of the two at 0.50 us, which is
+ *     exactly why the ordering has to be stated rather than inferred from a
+ *     passing benchmark.
  *
- * Net result is 244 tokens/s against the 246 tokens/s ordinary-AQL reference.
- * HSA_GRAPH_PM4_CONSERVATIVE_FENCE=1 restores the wider CP_COHER_CNTL action
- * set for fault isolation.  It never reorders the two packets, because the
- * narrow ordering above is the correct one.
+ * On the 512-node chain the resulting GFX9 boundary is 1.14 us per dependent
+ * edge against 1.29 us for the same chain dispatched as ordinary AQL.
  */
 inline bool ConservativeGfx9Fence() {
   static const bool enable = [] {
@@ -63,12 +85,84 @@ inline bool ConservativeGfx9Fence() {
   return enable;
 }
 
+/*
+ * GFX9 dependency boundary recipe, for fault isolation.
+ *
+ * The CP runs ACQUIRE_MEM in the PFP and DISPATCH_DIRECT in the ME, so the PFP
+ * can run the invalidate ahead of the producer it is supposed to order against.
+ * The recipe selects where the invalidate sits relative to the compute-idle
+ * drain, which is the only thing that keeps the PFP from starting the consumer.
+ */
+enum class Gfx9BoundaryRecipe {
+  kDrainAcquire,      // default: CS_PARTIAL_FLUSH, then ACQUIRE_MEM
+  kAcquireDrain,      // ACQUIRE_MEM, CS_PARTIAL_FLUSH (unsound, kept for bisection)
+  kAcquireOnly,       // ACQUIRE_MEM
+  kDrainOnly,         // CS_PARTIAL_FLUSH
+  kAcquireDrainAcquire,
+  kPfpSyncAcquire,    // PFP_SYNC_ME, ACQUIRE_MEM
+  kNone,              // no boundary at all
+};
+
+inline Gfx9BoundaryRecipe Gfx9BoundaryRecipeFromEnv() {
+  static const Gfx9BoundaryRecipe recipe = [] {
+    const char* value = std::getenv("HSA_GRAPH_PM4_GFX9_BOUNDARY");
+    if (value == nullptr) return Gfx9BoundaryRecipe::kDrainAcquire;
+    switch (value[0]) {
+      case 'd':
+        // "da" drains then acquires, "d" drains only.
+        return value[1] == 'a' ? Gfx9BoundaryRecipe::kDrainAcquire
+                               : Gfx9BoundaryRecipe::kDrainOnly;
+      case 'a':
+        // "a" acquires only, "ad" acquires then drains, "ada" does both sides.
+        if (value[1] != 'd') return Gfx9BoundaryRecipe::kAcquireOnly;
+        return value[2] == 'a' ? Gfx9BoundaryRecipe::kAcquireDrainAcquire
+                               : Gfx9BoundaryRecipe::kAcquireDrain;
+      case 'p':
+        return Gfx9BoundaryRecipe::kPfpSyncAcquire;
+      case 'n':
+        return Gfx9BoundaryRecipe::kNone;
+      default:
+        return Gfx9BoundaryRecipe::kDrainAcquire;
+    }
+  }();
+  return recipe;
+}
+
+/*
+ * GFX9 ACQUIRE_MEM tuning knobs, for fault isolation and cost measurement.
+ * HSA_GRAPH_PM4_GFX9_COHER replaces the CP_COHER_CNTL action set;
+ * HSA_GRAPH_PM4_GFX9_RANGE narrows the invalidated byte range (default all).
+ */
+struct Gfx9CoherOverride {
+  bool present;
+  uint32_t cntl;
+};
+
+// A present-but-zero setting is meaningful: an ACQUIRE_MEM with an empty action set is the
+// packet without the invalidation, which separates the two halves of the boundary cost.
+inline Gfx9CoherOverride Gfx9CoherCntlOverride() {
+  static const Gfx9CoherOverride value = [] {
+    const char* s = std::getenv("HSA_GRAPH_PM4_GFX9_COHER");
+    if (s == nullptr || s[0] == '\0') return Gfx9CoherOverride{false, 0};
+    return Gfx9CoherOverride{true, static_cast<uint32_t>(strtoull(s, nullptr, 0))};
+  }();
+  return value;
+}
+
+inline uint64_t Gfx9AcquireRangeBytes() {
+  static const uint64_t value = []() -> uint64_t {
+    const char* s = std::getenv("HSA_GRAPH_PM4_GFX9_RANGE");
+    if (s == nullptr || s[0] == '\0') return ~(uint64_t)0;
+    return static_cast<uint64_t>(strtoull(s, nullptr, 0));
+  }();
+  return value;
+}
+
 struct GraphCommandCapability {
   hsa_ven_amd_graph_encoder_family_t family;
   bool compile_supported;
   bool runtime_qualified;
 };
-
 inline GraphCommandCapability GetGraphCommandCapability(uint32_t major, uint32_t minor,
                                                         uint32_t stepping) {
   if (major == 9) {
@@ -78,7 +172,18 @@ inline GraphCommandCapability GetGraphCommandCapability(uint32_t major, uint32_t
     return {HSA_VEN_AMD_GRAPH_ENCODER_GFX11, true, true};
   }
   if (major == 12) {
-    return {HSA_VEN_AMD_GRAPH_ENCODER_GFX12, minor == 0, false};
+    // gfx1200 (12.0.0) and gfx1201 (12.0.1).  The qualification is on the
+    // minor-0 family rather than on the one part that was measured: the
+    // encoder keys off the family, and nothing this encoder touches - the
+    // COMPUTE_PGM_RSRC* image, ACQUIRE_MEM, the dispatch packets - differs
+    // between the two steppings.  The evidence is a gfx1201 board: dependent
+    // RMW chain at seven working sets in vector, scalar and read-only
+    // flavours, fifteen sparse-aliasing shapes with the emitted dword count
+    // checked against the dependency model, graph update and node
+    // enable/disable, and an LDS-saturating graph at 100 percent
+    // dependency-free edges, all exact.  gfx1250 (12.5.x) stays
+    // compile-unqualified: it is a different ISA revision and has not been run.
+    return {HSA_VEN_AMD_GRAPH_ENCODER_GFX12, minor == 0, minor == 0};
   }
   return {HSA_VEN_AMD_GRAPH_ENCODER_NONE, false, false};
 }
@@ -151,6 +256,15 @@ class Gfx9CommandEncoder {
       } else if (dependency == HSA_VEN_AMD_GRAPH_DEPENDENCY_VMEM_ONLY &&
                  (kernel_flags & HSA_VEN_AMD_GRAPH_KERNEL_VERIFIED_VMEM_ONLY) != 0) {
         DependencyBoundary(kCoherCntlVmem);
+      } else if (dependency == HSA_VEN_AMD_GRAPH_DEPENDENCY_NONE) {
+        // The caller proved there is no data dependency through device memory
+        // across this edge, so there is nothing to invalidate and nothing to
+        // order against: emit the dispatch alone.  A scalar-reading consumer
+        // still needs the scalar cache dropped, so refuse the downgrade when the
+        // caller flagged one rather than silently keeping a stale SCache line.
+        if ((kernel_flags & HSA_VEN_AMD_GRAPH_KERNEL_SCALAR_READS_GLOBAL) != 0) {
+          return false;
+        }
       } else {
         return false;
       }
@@ -263,16 +377,64 @@ class Gfx9CommandEncoder {
     words_.push_back(kEventCsPartialFlush);
   }
 
-  // Acquire first, drain second: see ConservativeGfx9Fence().
+  // Drain first, acquire second. See the ordering note at the top of the file:
+  // the CP neither serialises DISPATCH_DIRECT nor waits for the ME before it
+  // runs ACQUIRE_MEM, so the invalidate has to come after a compute-idle drain
+  // or it invalidates a cache the producer has not finished dirtying.
+  // HSA_GRAPH_PM4_GFX9_BOUNDARY reorders or drops the two for fault isolation.
   void DependencyBoundary(uint32_t coher_cntl) {
-    EmitAcquire(coher_cntl);
-    WaitComputeIdle();
+    switch (Gfx9BoundaryRecipeFromEnv()) {
+      case Gfx9BoundaryRecipe::kAcquireDrain:
+        EmitAcquire(coher_cntl);
+        WaitComputeIdle();
+        break;
+      case Gfx9BoundaryRecipe::kAcquireOnly:
+        EmitAcquire(coher_cntl);
+        break;
+      case Gfx9BoundaryRecipe::kDrainOnly:
+        WaitComputeIdle();
+        break;
+      case Gfx9BoundaryRecipe::kAcquireDrainAcquire:
+        EmitAcquire(coher_cntl);
+        WaitComputeIdle();
+        EmitAcquire(coher_cntl);
+        break;
+      case Gfx9BoundaryRecipe::kPfpSyncAcquire:
+        // PACKET3_PFP_SYNC_ME (0x60): hold the PFP until the ME has retired
+        // everything before it, then invalidate.
+        words_.push_back(Packet3(0x60, 1, false));
+        EmitAcquire(coher_cntl);
+        break;
+      case Gfx9BoundaryRecipe::kNone:
+        break;
+      case Gfx9BoundaryRecipe::kDrainAcquire:
+      default:
+        WaitComputeIdle();
+        EmitAcquire(coher_cntl);
+        break;
+    }
   }
 
   void EmitAcquire(uint32_t coher_cntl) {
+    const Gfx9CoherOverride ovr = Gfx9CoherCntlOverride();
+    if (ovr.present) {
+      coher_cntl = ovr.cntl;
+    }
+    uint64_t size = Gfx9AcquireRangeBytes();
+    if (size == ~(uint64_t)0) {
+      words_.insert(words_.end(), {
+          Packet3(kPacket3AcquireMem, 6, false), coher_cntl, UINT32_MAX, kCoherSizeHi, 0,
+          0, kCoherPollInterval,
+      });
+      return;
+    }
+    if (size != 0) {
+      size -= 1;
+    }
     words_.insert(words_.end(), {
-        Packet3(kPacket3AcquireMem, 6, false), coher_cntl, UINT32_MAX, kCoherSizeHi, 0,
-        0, kCoherPollInterval,
+        Packet3(kPacket3AcquireMem, 6, false), coher_cntl,
+        static_cast<uint32_t>(size & 0xFFFFFFFFu), static_cast<uint32_t>(size >> 32), 0, 0,
+        kCoherPollInterval,
     });
   }
 
@@ -360,6 +522,13 @@ class Gfx11CommandEncoder {
       } else if (dependency == HSA_VEN_AMD_GRAPH_DEPENDENCY_VMEM_ONLY &&
                  (kernel_flags & HSA_VEN_AMD_GRAPH_KERNEL_VERIFIED_VMEM_ONLY) != 0) {
         DependencyRmwVmem();
+      } else if (dependency == HSA_VEN_AMD_GRAPH_DEPENDENCY_NONE) {
+        // Nothing to invalidate and no GCR action override to apply.  A
+        // scalar-reading consumer still needs the scalar cache dropped, so refuse
+        // rather than leave a stale SCache line behind.
+        if ((kernel_flags & HSA_VEN_AMD_GRAPH_KERNEL_SCALAR_READS_GLOBAL) != 0) {
+          return false;
+        }
       } else {
         return false;
       }
@@ -557,6 +726,13 @@ class Gfx12CommandEncoder {
       } else if (dependency == HSA_VEN_AMD_GRAPH_DEPENDENCY_VMEM_ONLY &&
                  (kernel_flags & HSA_VEN_AMD_GRAPH_KERNEL_VERIFIED_VMEM_ONLY) != 0) {
         DependencyRmwVmem();
+      } else if (dependency == HSA_VEN_AMD_GRAPH_DEPENDENCY_NONE) {
+        // Nothing to invalidate and no GCR action override to apply.  A
+        // scalar-reading consumer still needs the scalar cache dropped, so refuse
+        // rather than leave a stale SCache line behind.
+        if ((kernel_flags & HSA_VEN_AMD_GRAPH_KERNEL_SCALAR_READS_GLOBAL) != 0) {
+          return false;
+        }
       } else {
         return false;
       }

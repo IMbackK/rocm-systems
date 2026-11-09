@@ -31,6 +31,7 @@ The documentation is structured as follows:
 
     * :ref:`contributing-to-rocr`
     * :ref:`retained-pm4-command-lists`
+    * :ref:`demand-driven-cache-flush`
 
 To contribute to the documentation, refer to
 `Contributing to ROCm  <https://rocm.docs.amd.com/en/latest/contribute/contributing.html>`_.
